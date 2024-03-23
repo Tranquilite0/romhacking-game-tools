@@ -7,17 +7,20 @@
 # The compression format is described in the decompressor.
 #
 # Modified by Tranquilite
-# Corrected issue where algorithm would only match up to 15 bytes instead of
-# the maximum possible of 17 (should match or beat the existing compression).
-# Switched to KMP search for a little speed boost.
 #
-# This code uses python-bitstring:
-# https://pypi.org/project/bitstring/
+# Now creates ideal compression chains by utilizing graph theory.
+# Marginally beats the greedy longest match compression.
+# Also use KMP search insted of brute force to keep compression times low.
+# Also switched from bitstring to bitarray since it was a bit faster.
+#
+# This code uses python-bitarray and networkx:
+# https://pypi.org/project/bitarray/
+# https://pypi.org/project/networkx/
 
 import os
 import sys
-import bitstring
-
+from bitarray import bitarray, util
+import networkx as nx
 
 # Define some useful constants.
 SEARCH_LOG2 = 8
@@ -26,11 +29,11 @@ LOOKAHEAD_LOG2 = 4
 LOOKAHEAD_SIZE = 2 ** LOOKAHEAD_LOG2
 BIT_PASTCOPY = 0
 BIT_LITERAL = 1
+WEIGHT_PASTCOPY = 13
+WEIGHT_LITERAL = 9
 MAX_UNCODED = 1
 MAX_CODED = LOOKAHEAD_SIZE + MAX_UNCODED
 MIN_CODED = 2
-
-
 
 def compress(inBytes):
     # Prepare the memory buffer.
@@ -38,40 +41,51 @@ def compress(inBytes):
     inBuffer[:SEARCH_SIZE] = [0x20] * SEARCH_SIZE
     inBuffer[SEARCH_SIZE:] = inBytes
 
-    # Prepare for compression.
-    output = bitstring.BitArray()
-    output += bitstring.pack("uintle:16", len(inBytes))
-    currentIndex = SEARCH_SIZE
+    # Create Graph for storing candidate compresion chain
+    dag = nx.DiGraph()
 
     # Main compression loop.
-    while currentIndex < len(inBuffer):
+    for currentIndex in range(SEARCH_SIZE, SEARCH_SIZE + len(inBytes)):
+        inputPos = currentIndex - SEARCH_SIZE
         bestIndex = 0
         bestLength = 0
 
-        #bestIndex, bestLength = BruteForceSearch(inBuffer, currentIndex)
+        #Maybe Binary search would be better?
         bestIndex, bestLength = KMPSearch(inBuffer, currentIndex-SEARCH_SIZE, currentIndex )
 
-        # Write the next block of compressed output.
-        if bestLength >= 2:
-            # For some reason, the decompressor expects the pastcopy
-            # source values to be offset by 0xEF. I have no idea why.
-            bestIndex = (bestIndex + 0xEF) & 0xFF
-            output += bitstring.pack("uint:1", BIT_PASTCOPY)
-            output += bitstring.pack(
-                "uint:n=v", n = SEARCH_LOG2, v = bestIndex
-            )
-            output += bitstring.pack(
-                "uint:n=v", n = LOOKAHEAD_LOG2, v = bestLength - 2
-            )
-            currentIndex += bestLength
-        else:
-            output += bitstring.pack("uint:1", BIT_LITERAL)
-            output += bitstring.pack("uint:8", inBuffer[currentIndex])
-            currentIndex += 1
+        # Create vertices in our Dag for every possible valid encoding from our current position to a future position
+        # and give it a weight which corresponds to the length of the encoding in bits (9 or 13)
+
+        # For some reason, the decompressor expects the pastcopy
+        # source values to be offset by 0xEF. I have no idea why.
+        bestIndex = (bestIndex + 0xEF) & 0xFF
+
+        # Create verices for matches of all valid match lengths (if any)
+        for length in range(MIN_CODED, bestLength+1):
+            #bits = bitstring.Bits(f'uint1={BIT_PASTCOPY}, uint{SEARCH_LOG2}={bestIndex}, uint{LOOKAHEAD_LOG2}={length - 2}')
+            bits = bitarray([BIT_PASTCOPY]) + util.int2ba(bestIndex, SEARCH_LOG2) + util.int2ba(length - MIN_CODED, LOOKAHEAD_LOG2)
+            dag.add_edge(inputPos, inputPos+length, weight=WEIGHT_PASTCOPY, bitstring=bits)
+
+        # Always add the Literal case as an edge to the next node.
+        #bits = bitstring.Bits(f'uint1={BIT_LITERAL}, uint8={inBuffer[currentIndex]}')
+        bits = bitarray([BIT_LITERAL]) + util.int2ba(inBuffer[currentIndex], 8)
+        dag.add_edge(inputPos, inputPos+1, weight=WEIGHT_LITERAL, bitstring=bits)
+
+    # Prepare for compression.
+    #output = bitstring.BitArray(uintle=len(inBytes), length=16)
+    outputLength = util.int2ba(len(inBytes), 16, 'little')
+    output = bitarray()
+
+    # Compute shortest path and compile output
+    nodes = nx.shortest_paths.dijkstra_path(dag, 0, len(inBytes))
+    edges = nx.utils.pairwise(nodes)
+
+    for u,v in edges:
+        #output.append(dag[u][v]["bitstring"])
+        output += dag[u][v]["bitstring"]
 
     # Return the compressed data.
-    return output.tobytes()
-
+    return outputLength.tobytes() + output.tobytes()
 
 def BruteForceSearch(inBuffer, currentIndex):
     bestLength = 0
@@ -167,6 +181,7 @@ def computeKMPPartials(pat):
             i += 1
 
     return kmpPartials
+
 
 
 # Open a file for reading and writing. If the file doesn't exist, create it.
